@@ -97,13 +97,7 @@ async function registerRoutes(app2) {
                   }
                 }
               }
-              const isRoomEmpty = room.players.length === 0 && room.disconnectedPlayers.size === 0;
-              if (isRoomEmpty) {
-                if (room.game?.rematchState.countdownHandle) {
-                  clearInterval(room.game.rematchState.countdownHandle);
-                }
-                rooms.delete(player.roomId);
-              }
+              checkAndDeleteRoomIfNeeded(room);
             }, 5 * 60 * 1e3);
             room.disconnectedPlayers.set(player.id, { player, disconnectTime, timeoutHandle });
           }
@@ -112,7 +106,7 @@ async function registerRoutes(app2) {
             playerId: player.id,
             playerName: player.name
           });
-          if (room.players.length > 0) {
+          if (!checkAndDeleteRoomIfNeeded(room)) {
             if (room.hostId === player.id && room.players.length > 0) {
               room.hostId = room.players[0].id;
               broadcastToRoom(room, {
@@ -131,43 +125,67 @@ async function registerRoutes(app2) {
       }
     });
   });
+  function checkAndDeleteRoomIfNeeded(room) {
+    const totalPlayers = room.players.length + room.disconnectedPlayers.size;
+    if (totalPlayers <= 1) {
+      if (room.players.length === 1) {
+        const lastPlayer = room.players[0];
+        send(lastPlayer.ws, {
+          type: "room_deleted",
+          message: "\u062C\u0645\u064A\u0639 \u0627\u0644\u0644\u0627\u0639\u0628\u064A\u0646 \u063A\u0627\u062F\u0631\u0648\u0627 \u0627\u0644\u063A\u0631\u0641\u0629"
+        });
+        console.log(`Kicking last player ${lastPlayer.name} from room ${room.id}`);
+      }
+      if (room.game?.rematchState.countdownHandle) {
+        clearInterval(room.game.rematchState.countdownHandle);
+      }
+      if (room.game?.gameTimerHandle) {
+        clearTimeout(room.game.gameTimerHandle);
+      }
+      room.disconnectedPlayers.forEach((disconnected) => {
+        clearTimeout(disconnected.timeoutHandle);
+      });
+      rooms.delete(room.id);
+      console.log(`Room ${room.id} deleted (insufficient players: ${totalPlayers})`);
+      return true;
+    }
+    return false;
+  }
+  function sendResultsToAllFinishedPlayers(room, reason = "player_finished") {
+    if (!room.game) return;
+    const results = calculateGameResults(room);
+    room.game.lastResults = {
+      winners: results.winners,
+      losers: results.losers,
+      stillPlaying: results.stillPlaying,
+      reason
+    };
+    room.players.forEach((player) => {
+      const playerData = room.game.players.get(player.id);
+      if (playerData && playerData.finished) {
+        send(player.ws, {
+          type: "game_results",
+          winners: results.winners,
+          losers: results.losers,
+          stillPlaying: results.stillPlaying,
+          sharedSecret: room.game.sharedSecret,
+          reason
+        });
+      }
+    });
+  }
   function checkGameEnd(room) {
     if (!room.game || room.game.status !== "playing") return;
     const allGamePlayers = Array.from(room.game.players.values());
-    const activePlayers = allGamePlayers.filter((p) => !p.finished);
     const allPlayersFinished = allGamePlayers.every((p) => p.finished);
-    if (activePlayers.length === 1) {
-      const lastPlayer = activePlayers[0];
-      lastPlayer.won = true;
-      lastPlayer.finished = true;
-      lastPlayer.endTime = Date.now();
+    if (allPlayersFinished && room.game) {
       room.game.status = "finished";
       room.game.endTime = Date.now();
-      const results = calculateGameResults(room);
-      room.players.forEach((player) => {
-        const playerData = room.game.players.get(player.id);
-        if (playerData && playerData.finished) {
-          send(player.ws, {
-            type: "game_results",
-            winners: results.winners,
-            losers: results.losers,
-            stillPlaying: results.stillPlaying,
-            sharedSecret: room.game.sharedSecret,
-            reason: "last_player_standing"
-          });
-        }
-      });
-    } else if (allPlayersFinished && room.game) {
-      room.game.status = "finished";
-      room.game.endTime = Date.now();
-      const results = calculateGameResults(room);
-      broadcastToRoom(room, {
-        type: "game_results",
-        winners: results.winners,
-        losers: results.losers,
-        stillPlaying: results.stillPlaying,
-        sharedSecret: room.game.sharedSecret
-      });
+      if (room.game.gameTimerHandle) {
+        clearTimeout(room.game.gameTimerHandle);
+        room.game.gameTimerHandle = void 0;
+      }
+      sendResultsToAllFinishedPlayers(room, "all_finished");
     }
   }
   function calculateGameResults(room) {
@@ -235,15 +253,23 @@ async function registerRoutes(app2) {
       }
       case "join_room": {
         const room = rooms.get(message.roomId);
+        if (!room) {
+          send(ws, { type: "error", message: "\u0627\u0644\u063A\u0631\u0641\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629 - \u0644\u0631\u0628\u0645\u0627 \u062A\u0645 \u062D\u0630\u0641\u0647\u0627" });
+          return;
+        }
+        if (room.players.length >= 10) {
+          send(ws, { type: "error", message: "\u0627\u0644\u063A\u0631\u0641\u0629 \u0645\u0645\u062A\u0644\u0626\u0629" });
+          return;
+        }
+        if (room.game && room.game.status === "playing") {
+          send(ws, { type: "error", message: "\u0627\u0644\u0644\u0639\u0628\u0629 \u062C\u0627\u0631\u064A \u0627\u0644\u0622\u0646 - \u0644\u0627 \u064A\u0645\u0643\u0646 \u0627\u0644\u0627\u0646\u0636\u0645\u0627\u0645" });
+          return;
+        }
+        if (room.game && room.game.status === "finished") {
+          send(ws, { type: "error", message: "\u0627\u0646\u062A\u0647\u062A \u0627\u0644\u0644\u0639\u0628\u0629 - \u064A\u0631\u062C\u0649 \u0625\u0646\u0634\u0627\u0621 \u063A\u0631\u0641\u0629 \u062C\u062F\u064A\u062F\u0629" });
+          return;
+        }
         if (room && room.players.length < 10) {
-          if (room.game && room.game.status === "playing") {
-            send(ws, { type: "error", message: "Game already in progress" });
-            return;
-          }
-          if (room.game && room.game.status === "finished") {
-            send(ws, { type: "error", message: "This game has finished. Please create a new room" });
-            return;
-          }
           const playerId = generatePlayerId();
           const player = {
             id: playerId,
@@ -334,6 +360,23 @@ async function registerRoutes(app2) {
             finished: false
           });
         });
+        const gameTimerHandle = setTimeout(() => {
+          console.log(`5-minute timer expired for room ${room.id}`);
+          if (room.game && room.game.status === "playing") {
+            room.game.players.forEach((playerData) => {
+              if (!playerData.finished) {
+                playerData.finished = true;
+                playerData.endTime = Date.now();
+                playerData.won = false;
+              }
+            });
+            room.game.status = "finished";
+            room.game.endTime = Date.now();
+            room.game.gameTimerHandle = void 0;
+            sendResultsToAllFinishedPlayers(room, "time_expired");
+          }
+        }, 5 * 60 * 1e3);
+        game.gameTimerHandle = gameTimerHandle;
         room.game = game;
         broadcastToRoom(room, {
           type: "game_started",
@@ -355,18 +398,7 @@ async function registerRoutes(app2) {
           return;
         }
         if (playerData.attempts.length >= room.settings.maxAttempts) {
-          playerData.finished = true;
-          playerData.endTime = Date.now();
-          send(ws, {
-            type: "max_attempts_reached",
-            message: "\u0644\u0642\u062F \u0627\u0633\u062A\u0646\u0641\u0630\u062A \u062C\u0645\u064A\u0639 \u0645\u062D\u0627\u0648\u0644\u0627\u062A\u0643"
-          });
-          const timeoutHandle = setTimeout(() => {
-            console.log(`Timeout reached for loser ${player.name} in room ${player.roomId}`);
-            checkGameEnd(room);
-          }, 5 * 60 * 1e3);
-          playerData.timeoutHandle = timeoutHandle;
-          checkGameEnd(room);
+          send(ws, { type: "error", message: "\u0644\u0642\u062F \u0627\u0633\u062A\u0646\u0641\u0630\u062A \u062C\u0645\u064A\u0639 \u0645\u062D\u0627\u0648\u0644\u0627\u062A\u0643 \u0628\u0627\u0644\u0641\u0639\u0644" });
           return;
         }
         const { correctCount, correctPositionCount } = checkGuess(room.game.sharedSecret, message.guess);
@@ -378,8 +410,13 @@ async function registerRoutes(app2) {
         };
         playerData.attempts.push(attempt);
         const won = correctPositionCount === room.settings.numDigits;
+        const isLastAttempt = playerData.attempts.length >= room.settings.maxAttempts;
         if (won) {
           playerData.won = true;
+          playerData.finished = true;
+          playerData.endTime = Date.now();
+        } else if (isLastAttempt) {
+          playerData.won = false;
           playerData.finished = true;
           playerData.endTime = Date.now();
         }
@@ -389,7 +426,8 @@ async function registerRoutes(app2) {
           correctCount,
           correctPositionCount,
           won,
-          attemptNumber: playerData.attempts.length
+          attemptNumber: playerData.attempts.length,
+          isLastAttempt
         });
         broadcastToRoom(room, {
           type: "player_attempt",
@@ -398,7 +436,14 @@ async function registerRoutes(app2) {
           attemptNumber: playerData.attempts.length,
           won
         }, ws);
-        if (won) {
+        if (playerData.finished) {
+          if (isLastAttempt && !won) {
+            send(ws, {
+              type: "max_attempts_reached",
+              message: "\u0644\u0642\u062F \u0627\u0633\u062A\u0646\u0641\u0630\u062A \u062C\u0645\u064A\u0639 \u0645\u062D\u0627\u0648\u0644\u0627\u062A\u0643"
+            });
+          }
+          sendResultsToAllFinishedPlayers(room, "player_finished");
           checkGameEnd(room);
         }
         break;
@@ -424,12 +469,12 @@ async function registerRoutes(app2) {
         if (!player) return;
         const room = rooms.get(player.roomId);
         if (!room || !room.game) return;
-        if (room.hostId !== player.id) {
-          send(ws, { type: "error", message: "Only host can request rematch" });
-          return;
-        }
         if (room.game.status !== "finished") {
           send(ws, { type: "error", message: "Game is not finished yet" });
+          return;
+        }
+        if (room.game.rematchState.requested) {
+          send(ws, { type: "error", message: "Rematch already requested" });
           return;
         }
         room.game.rematchState.requested = true;
@@ -438,7 +483,12 @@ async function registerRoutes(app2) {
         room.game.rematchState.votes.set(player.id, true);
         broadcastToRoom(room, {
           type: "rematch_requested",
-          countdown: 10
+          countdown: 10,
+          requestedBy: player.name,
+          votes: Array.from(room.game.rematchState.votes.entries()).map(([playerId, accepted]) => ({
+            playerId,
+            accepted
+          }))
         });
         const countdownHandle = setInterval(() => {
           if (!room.game || !room.game.rematchState.countdown) {
@@ -488,6 +538,23 @@ async function registerRoutes(app2) {
         room.game.rematchState.countdownHandle = countdownHandle;
         break;
       }
+      case "request_rematch_state": {
+        const player = players.get(ws);
+        if (!player) return;
+        const room = rooms.get(player.roomId);
+        if (!room || !room.game) return;
+        if (room.game.rematchState && room.game.rematchState.requested && room.game.rematchState.countdown !== null) {
+          send(ws, {
+            type: "rematch_requested",
+            countdown: room.game.rematchState.countdown,
+            votes: Array.from(room.game.rematchState.votes.entries()).map(([playerId, accepted]) => ({
+              playerId,
+              accepted
+            }))
+          });
+        }
+        break;
+      }
       case "rematch_vote": {
         const player = players.get(ws);
         if (!player) return;
@@ -507,6 +574,81 @@ async function registerRoutes(app2) {
             accepted
           }))
         });
+        const acceptedPlayers = Array.from(room.game.rematchState.votes.entries()).filter(([_, accepted]) => accepted).map(([playerId, _]) => playerId);
+        if (acceptedPlayers.length >= 2) {
+          if (room.game.rematchState.countdownHandle) {
+            clearInterval(room.game.rematchState.countdownHandle);
+          }
+          const rejectedPlayers = room.players.filter(
+            (p) => !acceptedPlayers.includes(p.id) && p.id !== room.hostId
+          );
+          rejectedPlayers.forEach((p) => {
+            send(p.ws, {
+              type: "kicked_from_room",
+              message: "\u0644\u0645 \u062A\u0642\u0628\u0644 \u0625\u0639\u0627\u062F\u0629 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629"
+            });
+          });
+          room.players = room.players.filter(
+            (p) => acceptedPlayers.includes(p.id) || p.id === room.hostId
+          );
+          rejectedPlayers.forEach((p) => {
+            room.disconnectedPlayers?.delete(p.id);
+          });
+          room.game = null;
+          broadcastToRoom(room, {
+            type: "rematch_starting",
+            players: room.players.map((p) => ({ id: p.id, name: p.name }))
+          });
+          const sharedSecret = generateSecretCode(room.settings.numDigits);
+          const game = {
+            sharedSecret,
+            status: "playing",
+            startTime: Date.now(),
+            endTime: null,
+            players: /* @__PURE__ */ new Map(),
+            lastResults: void 0,
+            gameTimerHandle: void 0,
+            rematchState: {
+              requested: false,
+              votes: /* @__PURE__ */ new Map(),
+              countdown: null
+            }
+          };
+          room.players.forEach((p) => {
+            game.players.set(p.id, {
+              playerId: p.id,
+              playerName: p.name,
+              attempts: [],
+              startTime: Date.now(),
+              endTime: null,
+              won: false,
+              finished: false
+            });
+          });
+          const gameTimerHandle = setTimeout(() => {
+            console.log(`5-minute timer expired for room ${room.id}`);
+            if (room.game && room.game.status === "playing") {
+              room.game.players.forEach((playerData) => {
+                if (!playerData.finished) {
+                  playerData.finished = true;
+                  playerData.endTime = Date.now();
+                  playerData.won = false;
+                }
+              });
+              room.game.status = "finished";
+              room.game.endTime = Date.now();
+              room.game.gameTimerHandle = void 0;
+              sendResultsToAllFinishedPlayers(room, "time_expired");
+            }
+          }, 5 * 60 * 1e3);
+          game.gameTimerHandle = gameTimerHandle;
+          room.game = game;
+          broadcastToRoom(room, {
+            type: "game_started",
+            sharedSecret,
+            settings: room.settings
+          });
+        }
         break;
       }
       case "reconnect": {
@@ -554,6 +696,16 @@ async function registerRoutes(app2) {
               finished: playerData.finished,
               won: playerData.won
             });
+            if (playerData.finished && room.game.lastResults) {
+              send(ws, {
+                type: "game_results",
+                winners: room.game.lastResults.winners,
+                losers: room.game.lastResults.losers,
+                stillPlaying: room.game.lastResults.stillPlaying,
+                sharedSecret: room.game.sharedSecret,
+                reason: room.game.lastResults.reason
+              });
+            }
           }
         }
         broadcastToRoom(room, {
@@ -587,12 +739,7 @@ async function registerRoutes(app2) {
           }
         }
         room.players = room.players.filter((p) => p.id !== player.id);
-        if (room.players.length === 0) {
-          if (room.game?.rematchState.countdownHandle) {
-            clearInterval(room.game.rematchState.countdownHandle);
-          }
-          rooms.delete(player.roomId);
-        } else {
+        if (!checkAndDeleteRoomIfNeeded(room)) {
           if (room.hostId === player.id && room.players.length > 0) {
             room.hostId = room.players[0].id;
             broadcastToRoom(room, {

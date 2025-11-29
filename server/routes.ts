@@ -40,6 +40,13 @@ interface GameSession {
   players: Map<string, PlayerGameData>;
   startTime: number;
   endTime: number | null;
+  gameTimerHandle?: NodeJS.Timeout; // 5-minute game timer
+  lastResults?: {
+    winners: any[];
+    losers: any[];
+    stillPlaying: any[];
+    reason: string;
+  }; // Store latest results for reconnecting players
   rematchState: {
     requested: boolean;
     votes: Map<string, boolean>; // playerId -> accepted
@@ -54,7 +61,7 @@ interface Room {
   players: Player[];
   disconnectedPlayers: Map<string, { player: Player; disconnectTime: number; timeoutHandle: NodeJS.Timeout }>;
   game: GameSession | null;
-  settings: { numDigits: number; maxAttempts: number };
+  settings: { numDigits: number; maxAttempts: number; cardsEnabled?: boolean };
   roomTimeoutHandle?: NodeJS.Timeout;
 }
 
@@ -181,14 +188,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 }
               }
               
-              // Delete room if it's completely empty
-              const isRoomEmpty = room.players.length === 0 && room.disconnectedPlayers.size === 0;
-              if (isRoomEmpty) {
-                if (room.game?.rematchState.countdownHandle) {
-                  clearInterval(room.game.rematchState.countdownHandle);
-                }
-                rooms.delete(player.roomId);
-              }
+              // Check if room should be deleted after timeout
+              checkAndDeleteRoomIfNeeded(room);
             }, 5 * 60 * 1000); // 5 minutes
             
             room.disconnectedPlayers.set(player.id, { player, disconnectTime, timeoutHandle });
@@ -201,8 +202,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
             playerName: player.name,
           });
           
-          // Update players list for remaining players
-          if (room.players.length > 0) {
+          // Check if room should be deleted (1 player left or empty)
+          if (!checkAndDeleteRoomIfNeeded(room)) {
+            // Room still has enough players
             // If host left, assign new host
             if (room.hostId === player.id && room.players.length > 0) {
               room.hostId = room.players[0].id;
@@ -224,53 +226,94 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
   });
 
+  // Check if room should be deleted (only 1 player or empty)
+  function checkAndDeleteRoomIfNeeded(room: Room): boolean {
+    const totalPlayers = room.players.length + room.disconnectedPlayers.size;
+    
+    // Delete room if only 1 player left (can't play multiplayer alone)
+    // OR if room is completely empty
+    if (totalPlayers <= 1) {
+      // Kick the last remaining player if any
+      if (room.players.length === 1) {
+        const lastPlayer = room.players[0];
+        send(lastPlayer.ws, {
+          type: "room_deleted",
+          message: "جميع اللاعبين غادروا الغرفة",
+        });
+        console.log(`Kicking last player ${lastPlayer.name} from room ${room.id}`);
+      }
+      
+      // Clean up all timers
+      if (room.game?.rematchState.countdownHandle) {
+        clearInterval(room.game.rematchState.countdownHandle);
+      }
+      if (room.game?.gameTimerHandle) {
+        clearTimeout(room.game.gameTimerHandle);
+      }
+      
+      // Clear all disconnected player timeouts
+      room.disconnectedPlayers.forEach((disconnected) => {
+        clearTimeout(disconnected.timeoutHandle);
+      });
+      
+      rooms.delete(room.id);
+      console.log(`Room ${room.id} deleted (insufficient players: ${totalPlayers})`);
+      return true;
+    }
+    
+    return false;
+  }
+
+  // Send current game results to ALL finished players
+  function sendResultsToAllFinishedPlayers(room: Room, reason: string = "player_finished") {
+    if (!room.game) return;
+    
+    const results = calculateGameResults(room);
+    
+    // Store results for reconnecting players
+    room.game.lastResults = {
+      winners: results.winners,
+      losers: results.losers,
+      stillPlaying: results.stillPlaying,
+      reason: reason,
+    };
+    
+    // Send updated results to ALL connected players who have finished
+    room.players.forEach((player) => {
+      const playerData = room.game!.players.get(player.id);
+      if (playerData && playerData.finished) {
+        send(player.ws, {
+          type: "game_results",
+          winners: results.winners,
+          losers: results.losers,
+          stillPlaying: results.stillPlaying,
+          sharedSecret: room.game!.sharedSecret,
+          reason: reason,
+        });
+      }
+    });
+  }
+
   function checkGameEnd(room: Room) {
     if (!room.game || room.game.status !== "playing") return;
     
     const allGamePlayers = Array.from(room.game.players.values());
-    const activePlayers = allGamePlayers.filter(p => !p.finished);
     const allPlayersFinished = allGamePlayers.every(p => p.finished);
     
-    // If only one player remains, declare them winner automatically
-    if (activePlayers.length === 1) {
-      const lastPlayer = activePlayers[0];
-      lastPlayer.won = true;
-      lastPlayer.finished = true;
-      lastPlayer.endTime = Date.now();
-      
+    // Only end game when ALL players have finished (won, lost, or timed out)
+    // Do NOT auto-win the last remaining player - they must play until they finish naturally
+    if (allPlayersFinished && room.game) {
       room.game.status = "finished";
       room.game.endTime = Date.now();
       
-      const results = calculateGameResults(room);
+      // Clear the game timer since game is ending
+      if (room.game.gameTimerHandle) {
+        clearTimeout(room.game.gameTimerHandle);
+        room.game.gameTimerHandle = undefined;
+      }
       
-      // Send results ONLY to finished players (winners/losers)
-      room.players.forEach((player) => {
-        const playerData = room.game!.players.get(player.id);
-        if (playerData && playerData.finished) {
-          send(player.ws, {
-            type: "game_results",
-            winners: results.winners,
-            losers: results.losers,
-            stillPlaying: results.stillPlaying,
-            sharedSecret: room.game!.sharedSecret,
-            reason: "last_player_standing",
-          });
-        }
-      });
-    } else if (allPlayersFinished && room.game) {
-      room.game.status = "finished";
-      room.game.endTime = Date.now();
-      
-      const results = calculateGameResults(room);
-      
-      // Send results to ALL players only when everyone is finished
-      broadcastToRoom(room, {
-        type: "game_results",
-        winners: results.winners,
-        losers: results.losers,
-        stillPlaying: results.stillPlaying,
-        sharedSecret: room.game.sharedSecret,
-      });
+      // Send final results to ALL finished players (everyone at this point)
+      sendResultsToAllFinishedPlayers(room, "all_finished");
     }
   }
 
@@ -354,18 +397,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       case "join_room": {
         const room = rooms.get(message.roomId);
+        
+        // Room doesn't exist
+        if (!room) {
+          send(ws, { type: "error", message: "الغرفة غير موجودة - لربما تم حذفها" });
+          return;
+        }
+        
+        // Check if room is full
+        if (room.players.length >= 10) {
+          send(ws, { type: "error", message: "الغرفة ممتلئة" });
+          return;
+        }
+        
+        // Don't allow joining if game is in progress
+        if (room.game && room.game.status === "playing") {
+          send(ws, { type: "error", message: "اللعبة جاري الآن - لا يمكن الانضمام" });
+          return;
+        }
+        
+        // Don't allow joining if game is finished (results screen)
+        if (room.game && room.game.status === "finished") {
+          send(ws, { type: "error", message: "انتهت اللعبة - يرجى إنشاء غرفة جديدة" });
+          return;
+        }
+        
+        // Proceed with join only if conditions are met
         if (room && room.players.length < 10) {
-          // Don't allow joining if game is in progress
-          if (room.game && room.game.status === "playing") {
-            send(ws, { type: "error", message: "Game already in progress" });
-            return;
-          }
-          
-          // Don't allow joining if game is finished (results screen)
-          if (room.game && room.game.status === "finished") {
-            send(ws, { type: "error", message: "This game has finished. Please create a new room" });
-            return;
-          }
           
           const playerId = generatePlayerId();
           const player: Player = {
@@ -483,6 +541,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
           });
         });
 
+        // Start 5-minute game timer
+        const gameTimerHandle = setTimeout(() => {
+          console.log(`5-minute timer expired for room ${room.id}`);
+          if (room.game && room.game.status === "playing") {
+            // Mark all unfinished players as losers
+            room.game.players.forEach((playerData) => {
+              if (!playerData.finished) {
+                playerData.finished = true;
+                playerData.endTime = Date.now();
+                playerData.won = false;
+              }
+            });
+            
+            // End the game first
+            room.game.status = "finished";
+            room.game.endTime = Date.now();
+            
+            // Clear the timer handle
+            room.game.gameTimerHandle = undefined;
+            
+            // Send final results to ALL finished players (everyone at this point)
+            sendResultsToAllFinishedPlayers(room, "time_expired");
+          }
+        }, 5 * 60 * 1000); // 5 minutes
+
+        game.gameTimerHandle = gameTimerHandle;
         room.game = game;
 
         // Broadcast game start to all players
@@ -510,27 +594,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return;
         }
 
-        // Check if max attempts reached
+        // Check if max attempts already reached (shouldn't happen but safety check)
         if (playerData.attempts.length >= room.settings.maxAttempts) {
-          playerData.finished = true;
-          playerData.endTime = Date.now();
-          
-          send(ws, {
-            type: "max_attempts_reached",
-            message: "لقد استنفذت جميع محاولاتك",
-          });
-          
-          // Set 5-minute timeout for losing player
-          const timeoutHandle = setTimeout(() => {
-            console.log(`Timeout reached for loser ${player.name} in room ${player.roomId}`);
-            // Game end will be checked when timeout expires if other players are still active
-            checkGameEnd(room);
-          }, 5 * 60 * 1000); // 5 minutes
-          
-          // Mark timeout handle on player data so we can clear it if they reconnect
-          (playerData as any).timeoutHandle = timeoutHandle;
-          
-          checkGameEnd(room);
+          send(ws, { type: "error", message: "لقد استنفذت جميع محاولاتك بالفعل" });
           return;
         }
 
@@ -546,9 +612,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         playerData.attempts.push(attempt);
 
         const won = correctPositionCount === room.settings.numDigits;
+        const isLastAttempt = playerData.attempts.length >= room.settings.maxAttempts;
         
+        // Mark as finished if won OR if this was the last attempt and didn't win
         if (won) {
           playerData.won = true;
+          playerData.finished = true;
+          playerData.endTime = Date.now();
+        } else if (isLastAttempt) {
+          // Out of attempts and didn't win - mark as loser
+          playerData.won = false;
           playerData.finished = true;
           playerData.endTime = Date.now();
         }
@@ -561,6 +634,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           correctPositionCount,
           won,
           attemptNumber: playerData.attempts.length,
+          isLastAttempt,
         });
 
         // Broadcast to others that this player made an attempt
@@ -569,11 +643,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
           playerId: player.id,
           playerName: player.name,
           attemptNumber: playerData.attempts.length,
+          guess: message.guess,
+          correctCount,
+          correctPositionCount,
           won,
         }, ws);
 
-        // Check if game should end
-        if (won) {
+        // If player just finished (won or ran out of attempts), send updated results
+        if (playerData.finished) {
+          if (isLastAttempt && !won) {
+            // Notify player they're out of attempts
+            send(ws, {
+              type: "max_attempts_reached",
+              message: "لقد استنفذت جميع محاولاتك",
+            });
+          }
+          
+          sendResultsToAllFinishedPlayers(room, "player_finished");
+          // Check if all players finished for final cleanup
           checkGameEnd(room);
         }
         break;
@@ -606,15 +693,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const room = rooms.get(player.roomId);
         if (!room || !room.game) return;
 
-        // Only host can request rematch
-        if (room.hostId !== player.id) {
-          send(ws, { type: "error", message: "Only host can request rematch" });
-          return;
-        }
-
         // Game must be finished
         if (room.game.status !== "finished") {
           send(ws, { type: "error", message: "Game is not finished yet" });
+          return;
+        }
+
+        // Check if rematch already requested
+        if (room.game.rematchState.requested) {
+          send(ws, { type: "error", message: "Rematch already requested" });
           return;
         }
 
@@ -623,13 +710,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         room.game.rematchState.votes.clear();
         room.game.rematchState.countdown = 10;
         
-        // Host automatically votes yes
+        // Player who requested automatically votes yes
         room.game.rematchState.votes.set(player.id, true);
 
-        // Broadcast rematch request
+        // Broadcast rematch request with current votes
         broadcastToRoom(room, {
           type: "rematch_requested",
           countdown: 10,
+          requestedBy: player.name,
+          votes: Array.from(room.game.rematchState.votes.entries()).map(([playerId, accepted]) => ({
+            playerId,
+            accepted,
+          })),
         });
 
         // Start countdown
@@ -697,6 +789,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
         break;
       }
 
+      case "request_rematch_state": {
+        const player = players.get(ws);
+        if (!player) return;
+
+        const room = rooms.get(player.roomId);
+        if (!room || !room.game) return;
+
+        // If there's an active rematch request, send it to the player
+        if (room.game.rematchState && room.game.rematchState.requested && room.game.rematchState.countdown !== null) {
+          send(ws, {
+            type: "rematch_requested",
+            countdown: room.game.rematchState.countdown,
+            votes: Array.from(room.game.rematchState.votes.entries()).map(([playerId, accepted]) => ({
+              playerId,
+              accepted,
+            })),
+          });
+        }
+        break;
+      }
+
       case "rematch_vote": {
         const player = players.get(ws);
         if (!player) return;
@@ -721,6 +834,108 @@ export async function registerRoutes(app: Express): Promise<Server> {
             accepted,
           })),
         });
+
+        // Check if we have at least 2 acceptances - if so, start immediately
+        const acceptedPlayers = Array.from(room.game.rematchState.votes.entries())
+          .filter(([_, accepted]) => accepted)
+          .map(([playerId, _]) => playerId);
+
+        if (acceptedPlayers.length >= 2) {
+          // Clear the countdown timer
+          if (room.game.rematchState.countdownHandle) {
+            clearInterval(room.game.rematchState.countdownHandle);
+          }
+
+          // Remove players who didn't accept
+          const rejectedPlayers = room.players.filter(
+            p => !acceptedPlayers.includes(p.id) && p.id !== room.hostId
+          );
+          
+          rejectedPlayers.forEach(p => {
+            send(p.ws, {
+              type: "kicked_from_room",
+              message: "لم تقبل إعادة المباراة",
+            });
+          });
+          
+          room.players = room.players.filter(p => 
+            acceptedPlayers.includes(p.id) || p.id === room.hostId
+          );
+          
+          // Remove players from disconnected as well
+          rejectedPlayers.forEach(p => {
+            room.disconnectedPlayers?.delete(p.id);
+          });
+          
+          // Reset game
+          room.game = null;
+          
+          // Notify accepted players that rematch is starting
+          broadcastToRoom(room, {
+            type: "rematch_starting",
+            players: room.players.map((p) => ({ id: p.id, name: p.name })),
+          });
+          
+          // Start new game automatically
+          const sharedSecret = generateSecretCode(room.settings.numDigits);
+          const game: GameSession = {
+            sharedSecret,
+            status: "playing",
+            startTime: Date.now(),
+            endTime: null,
+            players: new Map(),
+            lastResults: undefined,
+            gameTimerHandle: undefined,
+            rematchState: {
+              requested: false,
+              votes: new Map(),
+              countdown: null,
+            },
+          };
+
+          // Initialize player data
+          room.players.forEach((p) => {
+            game.players.set(p.id, {
+              playerId: p.id,
+              playerName: p.name,
+              attempts: [],
+              startTime: Date.now(),
+              endTime: null,
+              won: false,
+              finished: false,
+            });
+          });
+
+          // Start 5-minute game timer
+          const gameTimerHandle = setTimeout(() => {
+            console.log(`5-minute timer expired for room ${room.id}`);
+            if (room.game && room.game.status === "playing") {
+              room.game.players.forEach((playerData) => {
+                if (!playerData.finished) {
+                  playerData.finished = true;
+                  playerData.endTime = Date.now();
+                  playerData.won = false;
+                }
+              });
+              
+              room.game.status = "finished";
+              room.game.endTime = Date.now();
+              room.game.gameTimerHandle = undefined;
+              
+              sendResultsToAllFinishedPlayers(room, "time_expired");
+            }
+          }, 5 * 60 * 1000);
+
+          game.gameTimerHandle = gameTimerHandle;
+          room.game = game;
+
+          // Broadcast game start
+          broadcastToRoom(room, {
+            type: "game_started",
+            sharedSecret,
+            settings: room.settings,
+          });
+        }
         break;
       }
 
@@ -780,6 +995,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
               finished: playerData.finished,
               won: playerData.won,
             });
+            
+            // If player has finished, send them latest results
+            if (playerData.finished && room.game.lastResults) {
+              send(ws, {
+                type: "game_results",
+                winners: room.game.lastResults.winners,
+                losers: room.game.lastResults.losers,
+                stillPlaying: room.game.lastResults.stillPlaying,
+                sharedSecret: room.game.sharedSecret,
+                reason: room.game.lastResults.reason,
+              });
+            }
           }
         }
         
@@ -824,12 +1051,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         
         room.players = room.players.filter((p) => p.id !== player.id);
         
-        if (room.players.length === 0) {
-          if (room.game?.rematchState.countdownHandle) {
-            clearInterval(room.game.rematchState.countdownHandle);
-          }
-          rooms.delete(player.roomId);
-        } else {
+        // Check if room should be deleted
+        if (!checkAndDeleteRoomIfNeeded(room)) {
+          // Room still has enough players
           if (room.hostId === player.id && room.players.length > 0) {
             room.hostId = room.players[0].id;
             broadcastToRoom(room, {
